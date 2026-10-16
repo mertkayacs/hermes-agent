@@ -939,13 +939,16 @@ class SessionMessagesMixin:
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
         tail_count: int, carried_messages: Optional[list[dict[str, Any]]], patched_model_config: Any,
-        patch: bool, merged_away: set[int],
+        patch: bool, merged_away: set[int], carried_merged: Optional[set[int]] = None,
     ) -> int:
         """Archive *covered* as summarized and clone every other active row after the new set.
 
         A gap below the newest held id, and rows appended after an unpersisted turn, are not
         in *covered*. They take the concurrent-append path: rewind the original, insert the
         compacted transcript, then clone them so they stay live and searchable once each.
+        *carried_merged* names the run originals of a repair-merged dict the compacted transcript
+        itself carries: like the carried tail's originals, they are superseded duplicates and get
+        rewind flags, or display and search project the run beside the merged copy (#139210).
         """
         active_ids = [int(row["id"]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
         covered_set = set(covered)
@@ -954,6 +957,8 @@ class SessionMessagesMixin:
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
+        if carried_merged:
+            rewind_ids += sorted(carried_merged)
         if tail_count > 0:
             rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
         rewind_ids += unseen
@@ -1041,12 +1046,14 @@ class SessionMessagesMixin:
         # on_missing="raise": never commit against a vanished session row (caller keeps the original).
         patched_model_config = self._merge_model_config_json(
             conn, session_id, model_config_patch, on_missing="raise") if patch else None
-        proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
+        proved = self._proved_coverage(
+            conn, session_id, covered_ids, unresolved_held, watermark,
+            compacted_messages=compacted_messages)
         if proved is not None:
             return self._archive_named_rows(
                 conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                 carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
-                merged_away=proved[1])
+                merged_away=proved[1], carried_merged=proved[2])
         tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
             conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
             (session_id, int(watermark)))

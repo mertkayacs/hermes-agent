@@ -179,9 +179,10 @@ class SessionCoverageMixin:
     def _proved_coverage(
         self, conn, session_id: str, covered_ids: Optional[list[int]],
         unresolved_held: Optional[list[dict[str, Any]]], watermark: Optional[int] = None,
-    ) -> Optional[tuple[list[int], set[int]]]:
-        """``(ids safe to archive as summarized, ids merged into another held dict)``, or None when
-        a durable held row cannot be named.
+        compacted_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> Optional[tuple[list[int], set[int], set[int]]]:
+        """``(ids safe to archive as summarized, ids merged into another held dict, ids a carried
+        merged dict supersedes)``, or None when a durable held row cannot be named.
 
         An unresolved dict that still carries the persist marker was loaded from the DB.
         Failing to name it means the watermark path, which archives the rows the compressor
@@ -191,6 +192,11 @@ class SessionCoverageMixin:
         and so does a merged dict whose run cannot be named.
         The second set holds only merges the caller could not count: a dict that lists its
         own ``_absorbed_row_ids`` is already counted in ``tail_count``.
+        The third set names the run rows of a repair-merged dict that is itself carried into
+        the compacted transcript (protected head/tail). The merged copy is re-inserted, so its
+        originals are superseded duplicates: archiving them as summarized would project the run
+        beside the merged copy, so the same message appears twice (#139210). A merged dict that is NOT
+        re-inserted was summarized, and its run stays summarized with it.
         """
         if covered_ids is None:
             return None
@@ -198,8 +204,14 @@ class SessionCoverageMixin:
         from agent.conversation_compression_archive import (
             ABSORBED_ROW_IDS, MERGED_DURABLE_ROWS, OWN_ROW, RETIRED_DURABLE_ROWS, RETIRED_ROW)
 
+        carried_keys = {
+            (msg.get("role"), self._encode_content(msg.get("content")), msg.get("timestamp"))
+            for msg in compacted_messages or ()
+            if isinstance(msg, dict)
+        }
         proved = [int(row_id) for row_id in covered_ids if isinstance(row_id, int) and row_id > 0]
         merged_away: set[int] = set()
+        carried_merged: set[int] = set()
         for message in unresolved_held or ():
             if not isinstance(message, dict):
                 continue
@@ -228,8 +240,13 @@ class SessionCoverageMixin:
                     message.get(_DB_PERSISTED_MARKER) and len(matches) != 1 and not run):
                 return None
             proved.extend(matches or run)
+            if run and (
+                (message.get("role"), self._encode_content(message.get("content")),
+                 message.get("timestamp")) in carried_keys
+            ):
+                carried_merged.update(run)
             merged_away.update(set(run[1:]) - set(message.get(ABSORBED_ROW_IDS) or ()))
-        return list(dict.fromkeys(proved)), merged_away
+        return list(dict.fromkeys(proved)), merged_away, carried_merged
 
     @staticmethod
     def _uncounted_merged_rows(tail: list[dict[str, Any]]) -> int:
